@@ -1,0 +1,97 @@
+"""
+SQL 修正节点
+
+负责在 SQL 校验失败后，结合原问题原SQL数据库错误和完整上下文做最小必要修正
+只有 validate_sql 写入错误信息时，LangGraph 才会进入这个分支
+"""
+
+import yaml
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langgraph.runtime import Runtime
+
+from app.agent.context import DataAgentContext
+from app.agent.llm import llm
+from app.agent.sql_utils import extract_sql_text
+from app.agent.state import DataAgentState
+from app.core.log import logger
+from app.prompt.prompt_loader import load_prompt
+
+# SQL 校正闭环的最大回环次数：超过后不再回到 validate_sql，直接结束并给出错误提示
+MAX_CORRECTION = 3
+
+
+async def correct_sql(state: DataAgentState, runtime: Runtime[DataAgentContext]):
+    """根据校验错误修正 SQL"""
+
+    writer = runtime.stream_writer
+    step = "校正SQL"
+    writer({"type": "progress", "step": step, "status": "running"})
+
+    try:
+        # 校正 SQL 仍然需要完整上下文，避免模型只根据报错修语法却改丢业务语义
+        table_infos = state["table_infos"]
+        metric_infos = state["metric_infos"]
+        date_info = state["date_info"]
+        db_info = state["db_info"]
+        query = state["query"]
+
+        # sql 是待修正的候选 SQL，error 是数据库 explain 返回的具体错误信息
+        sql = state["sql"]
+        error = state["error"]
+
+        # 每次进入修正节点都累加一次计数，graph 的条件边用它判断是否还能继续回环
+        correction_count = state.get("correction_count", 0) + 1
+
+        prompt = PromptTemplate(
+            template=load_prompt("correct_sql"),
+            input_variables=[
+                "table_infos",
+                "metric_infos",
+                "date_info",
+                "db_info",
+                "query",
+                "sql",
+                "error",
+            ],
+        )
+        # 修正后的输出仍然是一条纯 SQL 文本，用来覆盖 state["sql"]
+        output_parser = StrOutputParser()
+        chain = prompt | llm | output_parser
+
+        raw_result = await chain.ainvoke(
+            {
+                # 与生成节点保持一致，用 YAML 向模型提供稳定 可读的结构化上下文
+                "table_infos": yaml.dump(
+                    table_infos, allow_unicode=True, sort_keys=False
+                ),
+                "metric_infos": yaml.dump(
+                    metric_infos, allow_unicode=True, sort_keys=False
+                ),
+                "date_info": yaml.dump(date_info, allow_unicode=True, sort_keys=False),
+                "db_info": yaml.dump(db_info, allow_unicode=True, sort_keys=False),
+                "query": query,
+                "sql": sql,
+                "error": error,
+            }
+        )
+
+        # 与生成节点保持一致的清洗，避免校正后又被代码块围栏带偏，白白消耗一次回环
+        result = extract_sql_text(raw_result)
+
+        logger.info(f"校正后的SQL：{result}")
+        writer({"type": "progress", "step": step, "status": "success"})
+
+        # 校正次数用尽时，这条 SQL 不会再回到校验节点，需要明确告诉前端失败原因
+        if correction_count >= MAX_CORRECTION:
+            writer(
+                {
+                    "type": "error",
+                    "message": f"SQL 已连续校正 {correction_count} 次仍未通过数据库校验，本次问数终止",
+                }
+            )
+        return {"sql": result, "correction_count": correction_count}
+    except Exception as e:
+        logger.error(f"{step} failed: {e}")
+        writer({"type": "progress", "step": step, "status": "error"})
+        raise
